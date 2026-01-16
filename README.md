@@ -2,15 +2,15 @@
 
 **Capability-based GitHub access for autonomous AI agents.**
 
-ghcap provides a security wrapper around the GitHub CLI (`gh`) that gives AI agents like [Codex](https://openai.com/index/openai-codex/), [Claude Code](https://claude.ai/code), or [Sprites](https://sprites.dev) the ability to interact with GitHub repositories without ever exposing credentials directly.
+ghcap provides a security wrapper around the *GitHub CLI*(`gh`) that gives AI agents like [Codex](https://openai.com/index/openai-codex/), [Claude Code](https://claude.ai/code)  the ability to interact with GitHub repositories without ever exposing credentials directly. The same pattern can be extended to work for any secrets.
 
 ## The Problem
 
-When you give an AI agent access to your GitHub repositories, you typically have two bad options:
+When you give an AI agent you want to limit the access that your AI Agent has, and you ideally don't want it to have access to your secrets or tokens. Most developers would consider one of the following options:
 
 1. **Give the agent your credentials** — The agent can do anything: delete repos, push to main, access private data across all your repositories.
 
-2. **Don't give access at all** — The agent can't clone, create PRs, or interact with your codebase meaningfully.
+2. **Don't give access at all** — The agent can't clone, create PRs, or interact with your codebase meaningfully, and you may just manually handle actions that require it.
 
 ghcap provides a third option: **capability-based access**.
 
@@ -24,19 +24,53 @@ Instead of handing the agent a token, ghcap:
 
 The agent gets *capabilities* (clone, create PR, comment) without getting *credentials* (the token itself).
 
-## Allowed Operations
-
-| Command | Subcommands |
-|---------|-------------|
-| `gh repo` | `view`, `clone` |
-| `gh pr` | `create`, `comment`, `view`, `list`, `checks`, `status` |
-| `gh issue` | `create`, `comment`, `view`, `list` |
-
-**Blocked:** `gh auth`, `gh api`, `gh repo delete`, `gh pr merge`, and everything else.
 
 ## Quick Start
 
-### Prerequisites
+### Using Sprites
+
+#### Download 
+
+Download sprites.dev https://sprites.dev 
+You get $30 free credits. This repository is not sponsored - though sponsorships from Fly.io would be welcomed :).
+
+```curl https://sprites.dev/install.sh | bash```
+
+* Follow installation instructions. 
+* log-in and create a machine: 
+```sprite login```
+
+
+#### Setting up
+
+Copy the script into your sprite machin to `scripts/init`.
+
+Run it:
+
+```
+chmod +x init
+sudo bash ./init sprite
+```
+
+Running this will:
+ Prompt root for a fine-grained GitHub PAT (hidden input)
+- Store it root-only (default: `/run/secrets/agent_github_pat`)
+- Write root-only config at `/etc/ghcap.conf` (token path + real `gh` binary)
+- Install an allowlisted wrapper at `/usr/local/bin/ghcap`
+- Install a `gh` shim for the agent user (`~/.local/bin/gh`) that runs `ghcap` via passwordless sudo (for `ghcap` only)
+
+#### Codex / Claude Code / Gemini
+
+Open your coding tool of choice.
+
+Prompt codex/claude/gemini to git clone your repository using ghcap e.g.
+
+```
+Download my the repository: <owner/repo> to ~/work/repo using:
+gh repo clone owner/repo ~/work/repo
+```
+
+#### Prerequisites
 
 Recommend to use https://sprites.dev for a quick set up. But below is included the minimum requirements if you don't use Sprites.
 
@@ -45,12 +79,9 @@ Recommend to use https://sprites.dev for a quick set up. But below is included t
 - A [fine-grained GitHub PAT](https://github.com/settings/tokens?type=beta) with appropriate permissions
 - A non-root user account for your agent (e.g., `sprite`, `agent`)
 
-### Sprites
-
-Set up sprites.dev and access a machine. You get $30 free credits. This repository is not sponsored - though sponsorships from Fly.io would be welcomed :).
 
 
-### Installation
+#### Installation
 
 #### Run the script as root:
 ```
@@ -58,19 +89,6 @@ Set up sprites.dev and access a machine. You get $30 free credits. This reposito
 sudo bash scripts/init <agent_username>
 
 # Enter your GitHub PAT when prompted
-```
-
-### Verify Installation
-
-```bash
-# As the agent user
-sudo -u sprite bash -lc 'gh repo view owner/repo'
-```
-
-### Clone a Repository (as Agent)
-
-```bash
-sudo -u sprite bash -lc 'gh repo clone owner/repo ~/work/repo'
 ```
 
 ## How It Works
@@ -200,3 +218,8 @@ MIT
 PRs welcome. Please ensure any changes maintain the security properties:
 - Agent must never have read access to credentials
 - Allowlist must be explicit (deny by default)
+
+## Planned Extensions
+* Generalise this to handle any and all secrets
+* Build a UI?
+
