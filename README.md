@@ -52,7 +52,7 @@ Set up sprites.dev and access a machine. You get $30 free credits. This reposito
 
 ### Installation
 
-####Run the script as root:
+#### Run the script as root:
 ```
 # Run the init script as root
 sudo bash scripts/init <agent_username>
