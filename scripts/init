@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# init: root-only setup for "capability, not credential" GitHub access via gh
+#
+# What it does:
+# - Prompts root for a fine-grained PAT (hidden input)
+# - Stores it root-only at /run/secrets/agent_github_pat (default)
+# - Writes /etc/ghcap.conf (root-only) pointing to TOKEN_FILE + the real gh binary
+# - Installs /usr/local/bin/ghcap (root wrapper; allowlisted)
+# - Installs ~/.local/bin/gh shim for AGENT_USER that runs ghcap via sudo
+#
+# Usage:
+#   sudo bash ./init [agent_user]
+# Example:
+#   sudo bash ./init sprite
+#
+# Note: /run is commonly cleared on reboot. Rerun init after reboot,
+#       or set SECRET_FILE to a persistent location.
+
+AGENT_USER="${1:-sprite}"
+
+SECRET_FILE="${SECRET_FILE:-/run/secrets/agent_github_pat}"
+CONF_FILE="${CONF_FILE:-/etc/ghcap.conf}"
+GHCAP_PATH="${GHCAP_PATH:-/usr/local/bin/ghcap}"
+SUDOERS_FILE="/etc/sudoers.d/ghcap-${AGENT_USER}"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Must be root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  die "run as root (e.g. sudo bash ./init ${AGENT_USER})"
+fi
+
+# Agent user must exist
+id "$AGENT_USER" >/dev/null 2>&1 || die "user '$AGENT_USER' does not exist"
+
+# Find agent home
+AGENT_HOME="$(getent passwd "$AGENT_USER" 2>/dev/null | cut -d: -f6 || true)"
+if [[ -z "$AGENT_HOME" || ! -d "$AGENT_HOME" ]]; then
+  # fallback
+  AGENT_HOME="$(eval echo "~${AGENT_USER}" 2>/dev/null || true)"
+fi
+[[ -n "$AGENT_HOME" && -d "$AGENT_HOME" ]] || die "could not determine home for '$AGENT_USER'"
+
+# Find a REAL gh binary (not a shim script)
+GH_BIN=""
+for p in "/.sprite/bin/gh" "/usr/bin/gh" "/usr/local/bin/gh" "/snap/bin/gh" "/bin/gh"; do
+  if [[ -x "$p" ]]; then
+    # Reject scripts (start with "#!")
+    magic="$(head -c 2 "$p" 2>/dev/null || true)"
+    if [[ "$magic" != "#!" ]]; then
+      GH_BIN="$p"
+      break
+    fi
+  fi
+done
+[[ -n "$GH_BIN" ]] || die "could not find a real 'gh' binary (install GitHub CLI first)"
+
+# Prompt for PAT (hidden). Non-interactive fallback: set GITHUB_PAT env var as root.
+PAT=""
+if [[ -t 0 ]]; then
+  printf "Enter GitHub PAT (input hidden): " >&2
+  IFS= read -r -s PAT
+  printf "\n" >&2
+else
+  PAT="${GITHUB_PAT:-}"
+fi
+[[ -n "$PAT" ]] || die "empty PAT"
+
+# Store token root-only (runtime secret)
+install -d -m 700 "$(dirname "$SECRET_FILE")"
+printf '%s' "$PAT" > "$SECRET_FILE"
+chmod 600 "$SECRET_FILE"
+chown root:root "$SECRET_FILE"
+unset PAT
+
+# Write root-only config for ghcap
+cat > "$CONF_FILE" <<CFG
+TOKEN_FILE=$SECRET_FILE
+GH_BIN=$GH_BIN
+CFG
+chmod 600 "$CONF_FILE"
+chown root:root "$CONF_FILE"
+
+# Install ghcap wrapper (root-owned)
+cat > "$GHCAP_PATH" <<'WRAP'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONF_FILE="/etc/ghcap.conf"
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+
+subcmd="${1:-}"; shift || true
+
+# Allow harmless meta commands
+case "$subcmd" in
+  ""|-h|--help|help|version|--version)
+    TMPHOME="$(mktemp -d)"; chmod 700 "$TMPHOME"
+    # Use minimal env to avoid persisting auth/config
+    if [[ -z "$subcmd" ]]; then
+      env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$TMPHOME" "$GH_BIN" --help "$@"
+    else
+      env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$TMPHOME" "$GH_BIN" "$subcmd" "$@"
+    fi
+    status=$?
+    rm -rf "$TMPHOME"
+    exit "$status"
+    ;;
+esac
+
+# Block token-revealing / overly powerful paths
+case "$subcmd" in
+  auth|api)
+    echo "Denied"
+    exit 1
+    ;;
+esac
+
+# Allowlist operational commands
+case "$subcmd" in
+  repo)
+    case "${1:-}" in view|clone) ;; *) echo "Denied"; exit 1 ;; esac
+    ;;
+  pr)
+    case "${1:-}" in create|comment|view|list|checks|status) ;; *) echo "Denied"; exit 1 ;; esac
+    ;;
+  issue)
+    case "${1:-}" in create|comment|view|list) ;; *) echo "Denied"; exit 1 ;; esac
+    ;;
+  *)
+    echo "Denied"
+    exit 1
+    ;;
+esac
+
+PAT="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+if [[ -z "$PAT" ]]; then
+  echo "ERROR: token file missing/empty at $TOKEN_FILE"
+  exit 1
+fi
+
+TMPHOME="$(mktemp -d)"; chmod 700 "$TMPHOME"
+
+env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$TMPHOME" \
+  GH_TOKEN="$PAT" GITHUB_TOKEN="$PAT" \
+  "$GH_BIN" "$subcmd" "$@"
+
+status=$?
+rm -rf "$TMPHOME"
+exit "$status"
+WRAP
+
+chmod 755 "$GHCAP_PATH"
+chown root:root "$GHCAP_PATH"
+
+# Sudoers: allow ONLY ghcap for the agent user
+echo "${AGENT_USER} ALL=(root) NOPASSWD: ${GHCAP_PATH}" > "$SUDOERS_FILE"
+chmod 440 "$SUDOERS_FILE"
+chown root:root "$SUDOERS_FILE"
+
+# Install agent shim in ~/.local/bin/gh
+install -d -m 755 "${AGENT_HOME}/.local/bin"
+cat > "${AGENT_HOME}/.local/bin/gh" <<'SHIM'
+#!/usr/bin/env bash
+exec sudo -n /usr/local/bin/ghcap "$@"
+SHIM
+chmod 755 "${AGENT_HOME}/.local/bin/gh"
+chown "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.local/bin/gh"
+
+# Ensure ~/.local/bin is on PATH (bash + zsh)
+ensure_line='export PATH="$HOME/.local/bin:$PATH"'
+for f in ".bashrc" ".profile" ".bash_profile" ".zshrc"; do
+  target="${AGENT_HOME}/${f}"
+  if [[ -e "$target" ]]; then
+    grep -qxF "$ensure_line" "$target" || echo "$ensure_line" >> "$target"
+  else
+    echo "$ensure_line" > "$target"
+  fi
+  chown "${AGENT_USER}:${AGENT_USER}" "$target" 2>/dev/null || true
+  chmod 644 "$target" 2>/dev/null || true
+done
+
+echo "OK:"
+echo "  Token stored (root-only): $SECRET_FILE   (note: /run may reset on reboot)"
+echo "  Config (root-only):       $CONF_FILE"
+echo "  Wrapper installed:        $GHCAP_PATH"
+echo "  Sudoers rule:             $SUDOERS_FILE"
+echo "  Agent shim installed:     ${AGENT_HOME}/.local/bin/gh"
+echo "  Using gh binary:          $GH_BIN"
+echo
+echo "Test (as agent):"
+echo "  sudo -u ${AGENT_USER} bash -lc 'hash -r; command -v gh; gh repo view OWNER/REPO >/dev/null && echo OK'"
+echo "Clone (as agent):"
+echo "  sudo -u ${AGENT_USER} bash -lc 'mkdir -p ~/work; gh repo clone OWNER/REPO ~/work/\$(basename OWNER/REPO)'"
